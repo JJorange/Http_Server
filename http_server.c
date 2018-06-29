@@ -7,13 +7,19 @@
 #include<sys/socket.h>
 #include<netinet/in.h>
 #include<arpa/inet.h>
+#include<sys/stat.h>
+#include<sys/sendfile.h>
+#include"http_server.h"
+#include <sys/types.h>
+#include <fcntl.h>
+
 typedef struct sockaddr sockaddr ;
 typedef struct sockaddr_in sockaddr_in;
 
 //一次从socket中读取一行数据
 //把数据放到buf缓冲区中
 //如果读取失败，返回值为-1
-int ReadLine(int sock,char buf[]，ssize_t size){
+int ReadLine(int sock,char buf[],ssize_t size){
 	   //1.从socket中一次读取一个字符
 	   char c = '\0';
 	   ssize_t i = 0;//当前读了多少个字符
@@ -26,7 +32,7 @@ int ReadLine(int sock,char buf[]，ssize_t size){
 			  if(read_size == 0){
 				     //预期读到\n这样的换行符
 					 //先读到EOF，这种情况认为是失败
-					 return -1；
+					 return -1;
 			  }
 			  if(c == '\r'){
 				     //当前遇到了\r，但还需确认下一个字符是否为\n
@@ -60,30 +66,31 @@ int Splist(char input[],const char* split_char,char* output[],int output_size){
 			      return i;
 		   }
 		   output[i++] = pch;
-		   pch = strtok_r(input,split_char,&tmp);
+		   pch = strtok_r(NULL,split_char,&tmp);
 	}
 	return i;
 }
 
-int ParseFirstLine(char fisr_line[],char** p_url,char** p_methon){
+int ParseFirstLine(char first_line[],char** p_url,char** p_method){
 	//把首行按照空格进行字符串切分
 	char* tok[10];
 	//把first_line按照空格进行字符串切分
 	//切分得到的每一个部分，就放到tok数组中
 	//返回值，就是tok数组中包含几个元素
 	//最有一个参数10表示tok数组最多能放几个元素
-	int tok_size = Splist(first_line," ",tok,10);
+	int tok_size = Splist(first_line, " ", tok, 10);
 	if(tok_size != 3){
-		printf("Split failed! tok_size = %d\n",tok_size)
-		   return -1;
-	}
-	*p_method  = tok[10];
+		printf("Split failed! tok_size = %d\n", tok_size);
+    return -1;
+  }
+	*p_method  = tok[0];
 	*p_url = tok[1];
 	return 0;
 }
 
 int ParseQueryString(char* url,char** p_url_path,char** p_query_string){
-	   char* p = url;
+  *p_url_path = url;
+  char* p = url;
 	   for(;*p != '\0';p++){
 		      if(*p == '?'){
 				  *p = '\0';		 
@@ -93,43 +100,244 @@ int ParseQueryString(char* url,char** p_url_path,char** p_query_string){
 	   }
 	   //循环结束没找到 ? ，说明这个请求不存在
 	   *p_query_string = NULL;
-	   return 0;
+	   return 0;  
 }
 
 int ParseHeader(int sock,int* content_length){   
 	   char buf[SIZE] = {0};
 	   while(1){
-		   dd;
 		   //1.循环从socket中读取一行
 		   ssize_t read_size = ReadLine(sock,buf,sizeof(buf));
 		   //处理读失败的情况
 		   if(read_size <= 0){    
 			   return -1;
 		   }
-		   //处理读完的情况
+		   //处理读完的情况--读到空行结束循环
 		   if(strcmp(buf,"\n") == 0){
 			      return 0;
 		   }
 		   //2.判定当前行是不是content_length
 		   //  如果是content_length就直接把value读取出来
 		   //  如果不是就直接丢弃
-		   const char* content_length_str = "Content-Length: "
+		   const char* content_length_str = "Content-Length: ";
 		   if(content_length != NULL 
 				   && strncmp(buf,"Content-Length: ",
 					   strlen(content_length_str)) == 0){
-			      *conten_length = atoi(buf + strlen(concent_length_str));
+			      *content_length = atoi(buf + strlen(content_length_str));
+
 		   }
 	   }
-	   //3.如果是，直接把value读出来
-	   //4.如果不是就直接丢弃
-	   //5.读到空行，循环结束
+	  return 0;
+}
+
+void Handler404(int sock){
+  //构造一个完整的HTTP响应
+  //状态码就是404
+  //body部分应该是一个40相关的错误页面
+  const char* first_line = "HTTP/1.1 404 Not Found\n";
+  const char* type_line = "Content-Type\" content=\"text/html;charset=utf-8\n";
+  const char* blank_line = "\n";
+  const char* html = "<head><meta http-equiv=\"Content-Type\" content=\"text/html;charset=utf-8\"></head>""<h1>喵喵喵</h1>";
+  send(sock,first_line,strlen(first_line),0);
+  send(sock,type_line,strlen(type_line),0);
+  send(sock,blank_line,strlen(blank_line),0);
+  //send(sock,type_line,strlen(type_line),0);
+  send(sock,html,strlen(html),0);
+  return;
+
+}
+
+void PrintRequest(Request* req){
+  printf("method: %s\n",req->method);
+  printf("url_path: %s\n",req->url_path);
+  printf("query_string: %s\n",req->query_string);
+  printf("conten_length: %d\n",req->content_length);
+  return;
+}
+
+int IsDir(const char* file_path)
+{
+  struct stat st;
+  int ret = stat(file_path, &st);
+  if(ret < 0)
+  {
+    return 0;
+  }
+  if (S_ISDIR(st.st_mode))
+  {
+    return 1;
+  }
+  return 0;
+}
+
+void HandlerFilePath(const char* url_path, char file_path[])
+{
+  //1)给url_path加上前缀（HTTP服务器的根目录）
+  //url_path => /index.html 
+  //file_path => ./wwwroot/index.html 
+  sprintf(file_path,"./wwwroot%s",url_path);
+  //2)例如url_path => /,此时url_path其实是一个目录
+  //如果是目录的话，就给这个目录之中追加一个index.html 
+  //url_path是 / 或者 /image/的情况
+  if(file_path[strlen(file_path) - 1] == '/')
+  {
+    strcat(file_path,"index.html");
+  }
+  //c)例如url_path => /image
+  if(IsDir(file_path))
+  {
+    strcat(file_path, "/index.html");
+  }
+  return;
+}
+
+ssize_t GetFileSize(const char* file_path)
+{
+  struct stat st;
+  int ret = stat(file_path, &st);
+  if(ret < 0)
+  {
+    //打开文件失败，很可能是文件不存在
+    //此时直接返回文件长度为零
+    return 0;
+  }
+  return st.st_size;
+}
+
+int WriteStaticFile(int sock,const char* file_path)
+{
+  //1.打开文件
+  //打开文件失败
+  int fd = open(file_path, O_RDONLY);
+  if(fd < 0)
+  {
+    perror("open");
+    return 404;
+  }
+  //2.把构造出来的HTTP响应，写入socket中
+  //  1)写入首行
+  const char* first_line = "HTTP/1.1 200 OK\n";
+  send(sock, first_line, strlen(first_line), 0);
+  //  2)写入header
+  //const char* type_line = "Content-Type: text/html;charset=utf-8\n";
+  //const char* type_line = "Content-Type: image/jpg;charset=utf-8\n";   
+  //send(sock, type_line, strlen(type_line), 0);
+  //  3)写入空行
+  const char* blank_line = "\n";
+  send(sock, blank_line, strlen(blank_line), 0);
+  //  4)写入body(文件内容)
+  /*
+  ssize_t file_size = GetFileSize(file_path);
+  ssize_t i = 0;
+  for(; i < file_size; ++i)
+  {
+    char c;
+    read(fd, &c, 1);
+    send(sock, &c, 1, 0);
+  }
+  */
+  sendfile(sock, fd , NULL, GetFileSize(file_path));
+
+  //3.关闭文件
+  close(fd);
+  return 200;
+}
+
+int HandlerStaticFile(int sock,Request* req){
+  //根据url_path获取到文件在服务器上的真是路径
+  char file_path[SIZE] = {0};
+  HandlerFilePath(req->url_path,file_path);
+  //2.读取文件，把文件的内容直接写到socket之中
+  int err_code = WriteStaticFile(sock, file_path);
+
+  return err_code;
+}
+
+int HandlerCGIFather(int new_sock, int father_read, 
+    int father_write,Request* req)
+{
+  //1.如果是POST请求，就把body写入到管道中
+  if(strcasecmp(req->method,"POST") == 0)
+  {
+    int i = 0;
+    char c = '\0';
+    for(; i < req->content_length; ++i)
+    {
+      read(new_sock, &c, 1);
+      write(father_write, &c, 1);
+    }
+  }
+  //2.构造HTTP响应
+  const char* first_line = "HTTP/1.1 200 OK\n";
+  send(new_sock, first_line, strlen(first_line), 0);
+  const char* type_line= "content-Type: text/html;charset=utf-8\n";
+  send(new_sock, type_line, strlen(type_line), 0);
+  const char* blank_line = "\n";
+  send();
+  /////////////////////////////41383
+
+
+  return 200;
+}
+
+int HandlerCGI(int new_sock,Request* req)
+{
+  int err_code = 200;
+  //1.创建一对匿名管道
+  int fd1[2],fd2[2];
+  pipe(fd1);
+  int ret = pipe(fd1);
+  if(ret < 0)
+    return 404;
+
+  ret = pipe(fd2);
+  if(ret < 0)
+  {
+    close(fd1[0]);
+    close(fd1[1]);
+    return 404;
+  }
+  // fd1   fd2描述性差
+  // 在此处定义几个明确的变量名进行描述
+  int father_read = fd1[0];
+  int child_write = fd1[1];
+  int father_write = fd2[1];
+  int child_read = fd2[0];
+  //2.创建子进程
+  ret = fork();
+  //3.父子进程各自执行不同的逻辑
+  if(ret > 0)
+  {
+    //父进程
+    close(child_read);
+    close(child_write);
+    HandlerCGIFather(new_sock, father_read, father_write, &req);  
+  }
+  else if(ret == 0)
+  {
+    //子进程
+    close(father_write);
+    close(father_read);
+    HandlerCGIChild();
+  }
+  else{
+    perror("fork");
+    err_code = 404;
+    goto END;
+  }
+  //4.收尾工作和错误处理
+END:
+  close(fd1[0]);
+  close(fd2[0]);        
+  close(fd1[1]);                      
+  close(fd2[1]); 
+  return err_code;
 }
 
 
 //请求处理函数
 void HandlerRequest(int new_sock){
 	   int err_code = 200;
-
 	   //1.读取并解析请求(反序列化)
 	   Request req;
 	   memset(&req,0,sizeof(req));
@@ -160,27 +368,37 @@ void HandlerRequest(int new_sock){
 	   //2.静态/动态方式生成页面,把生成结果写回到客户端上
 	   //假如浏览器发送的请求为"Get"/"get"
 	   //strcasecmp()不区分大小写比较
-	   if(strcasecmp(req.method,"GET") == 0 && req.query_string == NULL){
+	   if(strcasecmp(req.method,"GET") == 0 && req.query_string == NULL)
+     {
 		   //a)如果请求时GET请求，并且没有query_string	  
 		   //那么就返回静态页面
-		   ret = HandlerStaticFile();
-	   }else if(strcasecmp(req.method,"Get") == 0 && req.query_string != NULL){
+		   err_code = HandlerStaticFile(new_sock,&req);
+	   }
+     else if(strcasecmp(req.method,"Get") == 0 && req.query_string != NULL)
+     {
 		   //b)如果请求是GET请求，并且有query_string
 		   //		那么返回动态页面	
-		   ret = HandlerCGI();
-	   }else if(strcasecmp(req.method,"POST") == 0){
-		   //c)如果请求是POST请求（一定是有蚕食的，参数是通过body来传给服务器），
+		   err_code = HandlerCGI(new_sock, &req);
+	   }
+     else if(strcasecmp(req.method,"POST") == 0)
+     {
+		   //c)如果请求是POST请求（一定是蚕食的，参数是通过body来传给服务器），
 		   //		那么也返回动态页面
-		   ret = HandlerCGI();
-	   }else{
+		   err_code = HandlerCGI();
+	   }
+     else
+     {
 		   //TODO 错误处理
 		   err_code = 404;
 		   goto END;
 	   }
+
+     PrintRequest(&req);
 	   //错误处理：返回一个404
 END:
 	   if(err_code != 200){
-		      Handler404(new_sock);
+		   printf("!200");   
+       Handler404(new_sock);
 	   }
 	   close(new_sock);
 	   return;
@@ -204,15 +422,18 @@ void HttpServerStart(const char* ip,short port){
 		   perror("socket");
 		   return;
 	}
+  //加上这个选项就能重用TIME-WAIT连接
+  int opt = 1;
+  setsockopt(listen_sock,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
 	sockaddr_in addr;
 	addr.sin_family = AF_INET;
 	addr.sin_addr.s_addr = inet_addr(ip);
 	addr.sin_port = htons(port);
-	int ret = bind(listen_sock,(sockaddr*)&addr.sizeof(addr));
+	int ret = bind(listen_sock,(sockaddr*)&addr,sizeof(addr));
 	if(ret < 0){
 		   perror("bind");
 		   return;
-	}
+  }
 	ret = listen(listen_sock,5);
 	if(ret < 0){
 		   perror("listen");
@@ -229,18 +450,10 @@ void HttpServerStart(const char* ip,short port){
 		   }
 		   //使用多线程的方式来实现TCP服务器
 		   pthread_t tid;
-		   pthread_create(&tid,NULL)
+		   pthread_create(&tid, NULL, ThreadEntry, (void*)new_sock);
+       pthread_detach(tid);
 	}
 }
-
-
-
-
-
-
-
-
-
 
 
 
@@ -249,14 +462,13 @@ void HttpServerStart(const char* ip,short port){
 //./http_server [ip] [port]
 int main(int argc,char* argv[])
 {
-	if(argc != 3){
+	if(argc != 3)
+  {
 		printf("Usage ./http_server [ip] [port]\n");
 		return 1;
 	}
 	HttpServerStart(argv[1],atoi(argv[2]));
-	   return 0;
+  return 0;
 }
-
-```
 
 ```
