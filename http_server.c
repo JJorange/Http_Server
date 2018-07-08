@@ -11,6 +11,7 @@
 #include<sys/sendfile.h>
 #include"http_server.h"
 #include <sys/types.h>
+#include<wait.h>
 #include <fcntl.h>
 
 typedef struct sockaddr sockaddr ;
@@ -135,11 +136,14 @@ void Handler404(int sock){
   //状态码就是404
   //body部分应该是一个40相关的错误页面
   const char* first_line = "HTTP/1.1 404 Not Found\n";
-  const char* type_line = "Content-Type\" content=\"text/html;charset=utf-8\n";
+  const char* type_line = "Content-Type: text/html;charset=utf-8\n";
   const char* blank_line = "\n";
   const char* html = "<head><meta http-equiv=\"Content-Type\" content=\"text/html;charset=utf-8\"></head>""<h1>喵喵喵</h1>";
+  char content_length[1024] = {0};
+  sprintf(content_length,"Content-Length: %lu\n", strlen(html));
   send(sock,first_line,strlen(first_line),0);
   send(sock,type_line,strlen(type_line),0);
+  send(sock,content_length,strlen(content_length),0);
   send(sock,blank_line,strlen(blank_line),0);
   //send(sock,type_line,strlen(type_line),0);
   send(sock,html,strlen(html),0);
@@ -172,6 +176,7 @@ int IsDir(const char* file_path)
 
 void HandlerFilePath(const char* url_path, char file_path[])
 {
+  
   //1)给url_path加上前缀（HTTP服务器的根目录）
   //url_path => /index.html 
   //file_path => ./wwwroot/index.html 
@@ -189,6 +194,7 @@ void HandlerFilePath(const char* url_path, char file_path[])
     strcat(file_path, "/index.html");
   }
   return;
+  
 }
 
 ssize_t GetFileSize(const char* file_path)
@@ -244,6 +250,7 @@ int WriteStaticFile(int sock,const char* file_path)
 }
 
 int HandlerStaticFile(int sock,Request* req){
+  
   //根据url_path获取到文件在服务器上的真是路径
   char file_path[SIZE] = {0};
   HandlerFilePath(req->url_path,file_path);
@@ -251,10 +258,12 @@ int HandlerStaticFile(int sock,Request* req){
   int err_code = WriteStaticFile(sock, file_path);
 
   return err_code;
+  
 }
 
+
 int HandlerCGIFather(int new_sock, int father_read, 
-    int father_write,Request* req)
+    int father_write,int child_pid, Request* req)
 {
   //1.如果是POST请求，就把body写入到管道中
   if(strcasecmp(req->method,"POST") == 0)
@@ -273,13 +282,60 @@ int HandlerCGIFather(int new_sock, int father_read,
   const char* type_line= "content-Type: text/html;charset=utf-8\n";
   send(new_sock, type_line, strlen(type_line), 0);
   const char* blank_line = "\n";
-  send();
-  /////////////////////////////41383
-
-
+  send(new_sock, blank_line, strlen(blank_line), 0);
+  //3.循环从管道中读取数据并写入到 socket 
+  char c = '\0';
+  while(read(father_read, &c, 1) > 0)
+  {
+    send(new_sock, &c, 1, 0);
+  }
+  //4.回收子进程的资源
+  //wait(NULL);
+  waitpid(child_pid, NULL, 0);
   return 200;
 }
 
+int HandlerCGIChilr(int child_read, int child_write, 
+    Request* req)
+{
+  //1.设置必要的环境变量
+  char method_env[SIZE] = {0};
+  sprintf(method_env, "REQUEST_METHOD=%s",req->method);
+  putenv(method_env);
+  //还要设置 QUERY_STRING 或者 CONTENT_LENGTH
+  if(strcasecmp(req->method, "GET") == 0)
+  {
+    char query_string_env[SIZE] = {0};
+    sprintf(query_string_env, "QUERY_STRING=%s", 
+        req->query_string);
+    putenv(query_string_env);
+  }
+  else{
+    char content_length_env[SIZE] = {0};
+    sprintf(content_length_env, "CONTENT_LENGTH=%d",
+        req->content_length);
+    putenv(content_length_env);
+  }
+  //2.把标准输入输出重定向到管道中
+  dup2(child_read, 0);
+  dup2(child_write, 1);
+  //3.对子进程进行程序替换
+  // url_path: /cgi-bin/test 
+  // file_path:./wwwroot/cgi-bin/test 
+  char file_path[SIZE] = {0};
+  HandlerFilePath(req->url_path, file_path);
+  //l 
+  //lp
+  //le
+  //v 
+  //vp
+  //ve
+  execl(file_path, file_path, NULL);
+  exit(1);
+
+  return 200;
+}
+ 
 int HandlerCGI(int new_sock,Request* req)
 {
   int err_code = 200;
@@ -309,16 +365,24 @@ int HandlerCGI(int new_sock,Request* req)
   if(ret > 0)
   {
     //父进程
+    //此处父进程优先关闭这两个管道的文件描述符，
+    //是为了后续父进程从子进程这里读取数据的时候，能够读到EOF
+    //对于管道来说，所有的写端关闭继续读，才有EOF
+    //而此处的所有写端，一方面是父进程需要关闭，另一方面是子进程
+    //也需要关闭
+    //所以此处父进程先关闭不必要的写端之后，后续子进程用完了
+    //直接关闭，父进程也就读到了EOF
     close(child_read);
     close(child_write);
-    HandlerCGIFather(new_sock, father_read, father_write, &req);  
+    err_code = HandlerCGIFather(new_sock, father_read, 
+        father_write, ret, req);  
   }
   else if(ret == 0)
   {
     //子进程
     close(father_write);
     close(father_read);
-    HandlerCGIChild();
+    err_code = HandlerCGIChilr(child_read, child_write, req);
   }
   else{
     perror("fork");
@@ -372,7 +436,7 @@ void HandlerRequest(int new_sock){
      {
 		   //a)如果请求时GET请求，并且没有query_string	  
 		   //那么就返回静态页面
-		   err_code = HandlerStaticFile(new_sock,&req);
+		  err_code = HandlerStaticFile(new_sock,&req);
 	   }
      else if(strcasecmp(req.method,"Get") == 0 && req.query_string != NULL)
      {
@@ -384,8 +448,8 @@ void HandlerRequest(int new_sock){
      {
 		   //c)如果请求是POST请求（一定是蚕食的，参数是通过body来传给服务器），
 		   //		那么也返回动态页面
-		   err_code = HandlerCGI();
-	   }
+		   err_code = HandlerCGI(new_sock, &req);
+     }
      else
      {
 		   //TODO 错误处理
@@ -470,5 +534,4 @@ int main(int argc,char* argv[])
 	HttpServerStart(argv[1],atoi(argv[2]));
   return 0;
 }
-
 ```
