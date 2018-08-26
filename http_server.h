@@ -5,6 +5,8 @@
 #define SIZE 10240
 
 typedef struct Request(){
+
+
 	   char first_line[SIZE];
 	   char* method;
 	   char* url;
