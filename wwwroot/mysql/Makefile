@@ -4,5 +4,5 @@ select:select.c
 
 .PHONY:clean
 clean:
-	rm select
+	rm select   
 ```
