@@ -5,7 +5,7 @@
 #include<unistd.h>
 
 // 分GET、POST两种情况读取计算的参数
-// 1.GET 从query_string读取
+// 1.GET 从query_string读取  
 // 2.POST 从body中读取
 // 读取的结果放在buf输出缓冲区中
 static int GetQueryString(char buf[])
